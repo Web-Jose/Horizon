@@ -1,0 +1,235 @@
+-- Moving Home Planner — V1 Schema (Postgres / Supabase friendly)
+
+-- =========
+-- ENUM TYPES
+-- =========
+create type fee_rule_type as enum ('flat','tiered','percent');
+create type allocation_method as enum ('prorata','quantity');
+create type assigned_to as enum ('me','him','both');
+create type savings_target_source as enum ('planned','est','actual');
+
+-- =========
+-- CORE / AUTH
+-- =========
+create table workspaces (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  zip text,
+  currency text not null,
+  sales_tax_rate_pct numeric(6,4) not null default 0, -- percent (e.g. 0.0825 = 8.25%)
+  move_in_date date,
+  created_by uuid not null, -- references auth.users(id) in Supabase
+  created_at timestamptz not null default now()
+);
+
+create table members (
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  user_id uuid not null, -- references auth.users(id) in Supabase
+  role text not null check (role = 'member'),
+  primary key (workspace_id, user_id)
+);
+
+-- =========
+-- TAXONOMY
+-- =========
+create table categories (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  name text not null,
+  color text,
+  unique (workspace_id, name)
+);
+
+create table rooms (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  name text not null,
+  unique (workspace_id, name)
+);
+
+-- =========
+-- COMPANIES & FEE RULES
+-- =========
+create table companies (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  name text not null,
+  website text,
+  fees_taxable boolean not null default false,
+  tax_override_pct numeric(6,4), -- optional percent override
+  unique (workspace_id, name)
+);
+
+create table company_fee_rules (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references companies(id) on delete cascade,
+  type fee_rule_type not null,
+  flat_cents integer,               -- for type='flat'
+  percent_rate numeric(6,4),        -- for type='percent' (e.g. 0.05 = 5%)
+  version integer not null default 1,
+  active boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+create table company_fee_tiers (
+  id uuid primary key default gen_random_uuid(),
+  fee_rule_id uuid not null references company_fee_rules(id) on delete cascade,
+  threshold_cents integer not null, -- "≤ threshold" bucket
+  fee_cents integer not null
+);
+
+-- =========
+-- ITEMS & PRICES
+-- =========
+create table items (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  name text not null,
+  link text,
+  image_url text,
+  category_id uuid references categories(id) on delete set null,
+  room_id uuid references rooms(id) on delete set null,
+  company_id uuid references companies(id) on delete set null,
+  quantity integer not null default 1 check (quantity >= 1),
+  priority smallint not null default 2 check (priority between 1 and 3),
+  purchased boolean not null default false,
+  notes text,
+  created_at timestamptz not null default now()
+);
+
+create table item_prices (
+  id uuid primary key default gen_random_uuid(),
+  item_id uuid not null references items(id) on delete cascade,
+  est_unit_cents integer not null,
+  actual_unit_cents integer, -- nullable until purchased
+  created_at timestamptz not null default now()
+);
+
+-- =========
+-- ORDERS, TOTALS & ALLOCATIONS
+-- =========
+create table orders (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  company_id uuid not null references companies(id) on delete restrict,
+  order_date date not null,
+  created_at timestamptz not null default now()
+);
+
+create table order_items (
+  order_id uuid not null references orders(id) on delete cascade,
+  item_id uuid not null references items(id) on delete cascade,
+  primary key (order_id, item_id)
+);
+
+create table order_totals (
+  order_id uuid primary key references orders(id) on delete cascade,
+  subtotal_cents integer not null default 0,
+  delivery_fee_cents integer not null default 0,
+  other_fees_cents integer not null default 0,
+  tax_cents integer not null default 0
+);
+
+create table order_item_allocations (
+  order_id uuid not null references orders(id) on delete cascade,
+  item_id uuid not null references items(id) on delete cascade,
+  alloc_delivery_cents integer not null default 0,
+  alloc_other_fees_cents integer not null default 0,
+  alloc_tax_cents integer not null default 0,
+  method allocation_method not null,
+  primary key (order_id, item_id)
+);
+
+-- =========
+-- TASKS & MILESTONES
+-- =========
+create table tasks (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  title text not null,
+  assigned_to assigned_to not null,
+  category_id uuid references categories(id) on delete set null,
+  due_date date,
+  priority smallint not null default 2 check (priority between 1 and 3),
+  notes text,
+  done boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+create table milestones (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  name text not null,
+  date date not null,
+  notes text,
+  created_at timestamptz not null default now()
+);
+
+create table milestone_links (
+  id uuid primary key default gen_random_uuid(),
+  milestone_id uuid not null references milestones(id) on delete cascade,
+  item_id uuid references items(id) on delete cascade,
+  task_id uuid references tasks(id) on delete cascade,
+  -- exactly one of (item_id, task_id) must be present
+  check (num_nonnulls(item_id, task_id) = 1)
+);
+
+-- =========
+-- BUDGETS & SAVINGS
+-- =========
+create table room_budgets (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  room_id uuid not null references rooms(id) on delete cascade,
+  planned_cents integer not null default 0,
+  target_date date,
+  savings_target_source savings_target_source not null default 'planned',
+  unique (workspace_id, room_id)
+);
+
+create table savings_deposits (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  room_id uuid not null references rooms(id) on delete cascade,
+  date date not null,
+  amount_cents integer not null,
+  note text
+);
+
+-- =========
+-- AUDIT / ACTIVITY
+-- =========
+create table activity_log (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  actor_id uuid, -- references auth.users(id) in Supabase
+  type text not null,
+  entity text not null,
+  entity_id uuid,
+  payload jsonb,
+  created_at timestamptz not null default now()
+);
+
+-- =========
+-- INDEXES (practical)
+-- =========
+create index idx_categories_ws on categories(workspace_id);
+create index idx_rooms_ws on rooms(workspace_id);
+create index idx_companies_ws on companies(workspace_id);
+create index idx_items_ws on items(workspace_id);
+create index idx_items_company on items(company_id);
+create index idx_item_prices_item on item_prices(item_id);
+create index idx_orders_ws on orders(workspace_id);
+create index idx_orders_company on orders(company_id);
+create index idx_order_items_item on order_items(item_id);
+create index idx_tasks_ws_done on tasks(workspace_id, done);
+create index idx_milestones_ws_date on milestones(workspace_id, date);
+create index idx_savings_ws_room on savings_deposits(workspace_id, room_id);
+create index idx_room_budgets_ws_room on room_budgets(workspace_id, room_id);
+create index idx_activity_ws_created on activity_log(workspace_id, created_at);
+
+-- =========
+-- NOTES
+-- - Store all money as integer cents; display with bankers' rounding in UI/rules layer.
+-- - RLS: add workspace_id-based policies restricting access to workspace members.
+-- =========
